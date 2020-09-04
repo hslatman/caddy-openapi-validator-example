@@ -26,4 +26,5 @@ The (currently incomplete) API can then be accessed via https://localhost:9443/a
 
 A small and incomplete list of things to add:
 
-* Add more configuration?
+* Add more configurations?
+* Improve the example with more realistic and correct handlers

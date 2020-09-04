@@ -21,6 +21,8 @@ import (
 	"github.com/oxtoacart/bpool"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -29,7 +31,15 @@ import (
 
 func init() {
 	caddy.RegisterModule(Validator{})
+	httpcaddyfile.RegisterHandlerDirective("openapi_validator", parseCaddyfile)
 }
+
+const (
+	// ReplacerOpenAPIValidatorErrorMessage is a Caddy Replacer key for storing OpenAPI validation error messages
+	ReplacerOpenAPIValidatorErrorMessage = "openapi_validator.error_message"
+	// ReplacerOpenAPIValidatorStatusCode is a Caddy Replacer key for storing a status code
+	ReplacerOpenAPIValidatorStatusCode = "openapi_validator.status_code"
+)
 
 // Validator is used to validate OpenAPI requests and responses against an OpenAPI specification
 type Validator struct {
@@ -54,6 +64,10 @@ type Validator struct {
 	// Indicates whether request validation should be enabled
 	// Default is true
 	ValidateResponses *bool `json:"validate_responses,omitempty"`
+	// Indicates whether the OpenAPI specification should be enforced, meaning that invalid
+	// requests and responses will be filtered and an (appropriate) status is returned
+	// Default is true
+	Enforce *bool `json:"enforce,omitempty"`
 
 	// TODO: some option to add/override server / disable the server check
 }
@@ -70,35 +84,14 @@ func (Validator) CaddyModule() caddy.ModuleInfo {
 func (v *Validator) Provision(ctx caddy.Context) error {
 
 	v.logger = ctx.Logger(v)
+	defer v.logger.Sync()
 
-	// TODO: provide option to continue, even though the file does not exist? Like simply passing on to the next handler, without anything else?
-	if v.Filepath == "" {
-		return fmt.Errorf("path to an OpenAPI specification should be provided")
-	}
+	v.bufferPool = bpool.NewBufferPool(64)
 
-	specification, err := readOpenAPISpecification(v.Filepath)
+	err := v.prepareOpenAPISpecification()
 	if err != nil {
 		return err
 	}
-	//specification.Servers = nil  // TODO: make it possible to configure this
-	//specification.Security = nil // TODO: make it possible to configure this
-	v.specification = specification
-
-	// TODO: validate the specification is a valid spec? Is actually performed via WithSwagger, but can break the program, so we might need to to this in Validate()
-	router := openapi3filter.NewRouter().WithSwagger(v.specification)
-	v.router = router
-
-	v.options = &validatorOptions{
-		Options: openapi3filter.Options{
-			ExcludeRequestBody:    false,
-			ExcludeResponseBody:   false,
-			IncludeResponseStatus: true,
-			AuthenticationFunc:    NoopAuthenticationFunc, // TODO: can we provide an actual one? Should we? And how?
-		},
-		//ParamDecoder: ,
-	}
-
-	v.bufferPool = bpool.NewBufferPool(64)
 
 	return nil
 }
@@ -125,13 +118,24 @@ func (v *Validator) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	var requestValidationInput *openapi3filter.RequestValidationInput = nil
 	var oerr *oapiError = nil
 
+	replacer := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	replacer.Set(ReplacerOpenAPIValidatorErrorMessage, "")
+	replacer.Set(ReplacerOpenAPIValidatorStatusCode, -1)
+
 	if v.ValidateRoutes == nil || *v.ValidateRoutes {
 		requestValidationInput, oerr = v.validateRoute(r)
 		if oerr != nil {
 			// TODO: we should generate an error response here based on some of the returned data? in what format? (configured or via accept headers?)
 			v.logger.Error(oerr.Error())
-			w.WriteHeader(oerr.Code)
-			return nil // TODO: return the actual error here?
+
+			replacer.Set(ReplacerOpenAPIValidatorErrorMessage, oerr.Error())
+			replacer.Set(ReplacerOpenAPIValidatorStatusCode, oerr.Code)
+
+			if v.shouldEnforce() {
+				w.Header().Set("Content-Type", "application/json") // TODO: set the proper type, based on Accept header?
+				w.WriteHeader(oerr.Code)                           // TODO: find out if this is required; it seems it is.
+				return oerr
+			}
 		}
 	}
 
@@ -140,8 +144,15 @@ func (v *Validator) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		if oerr != nil {
 			// TODO: we should generate an error response here based on some of the returned data? in what format? (configured or via accept headers?)
 			v.logger.Error(oerr.Error())
-			w.WriteHeader(oerr.Code)
-			return nil // TODO: return the actual error here?
+
+			replacer.Set(ReplacerOpenAPIValidatorErrorMessage, oerr.Error())
+			replacer.Set(ReplacerOpenAPIValidatorStatusCode, oerr.Code)
+
+			if v.shouldEnforce() {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(oerr.Code)
+				return oerr
+			}
 		}
 	}
 
@@ -177,8 +188,15 @@ func (v *Validator) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		// TODO: we should generate an error response here based on some of the returned data? in what format? (configured or via accept headers?)
 		// TODO: we might also want to send this information in some other way, like setting a header, only logging, or in response format itself
 		v.logger.Error(oerr.Error())
-		w.WriteHeader(oerr.Code)
-		return nil // TODO: return the actual error here?
+
+		replacer.Set(ReplacerOpenAPIValidatorErrorMessage, oerr.Error())
+		replacer.Set(ReplacerOpenAPIValidatorStatusCode, oerr.Code)
+
+		if v.shouldEnforce() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(oerr.Code)
+			return oerr
+		}
 	}
 
 	// TODO: we've wrapped the handler chain and are at the end; if there are errors, we may want to override the response and its
@@ -189,9 +207,46 @@ func (v *Validator) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	return recorder.WriteResponse() // Actually writes the response (after having buffered the bytes) the easy way; returning underlying errors (if any)
 }
 
+func (v *Validator) prepareOpenAPISpecification() error {
+
+	// TODO: provide option to continue, even though the file does not exist? Like simply passing on to the next handler, without anything else?
+	if v.Filepath == "" {
+		return fmt.Errorf("path/URI to an OpenAPI specification should be provided")
+	}
+
+	specification, err := readOpenAPISpecification(v.Filepath) // TODO: make this lazy (and/or cache when loaded from URI?)
+	if err != nil {
+		return err
+	}
+	//specification.Servers = nil  // TODO: make it possible to configure this
+	//specification.Security = nil // TODO: make it possible to configure this
+	v.specification = specification
+
+	// TODO: validate the specification is a valid spec? Is actually performed via WithSwagger, but can break the program, so we might need to to this in Validate()
+	router := openapi3filter.NewRouter().WithSwagger(v.specification)
+	v.router = router
+
+	v.options = &validatorOptions{
+		Options: openapi3filter.Options{
+			ExcludeRequestBody:    false,
+			ExcludeResponseBody:   false,
+			IncludeResponseStatus: true,
+			AuthenticationFunc:    NoopAuthenticationFunc, // TODO: can we provide an actual one? Should we? And how?
+		},
+		//ParamDecoder: ,
+	}
+
+	return nil
+}
+
+func (v *Validator) shouldEnforce() bool {
+	return v.Enforce == nil || *v.Enforce
+}
+
 var (
 	_ caddy.Module                = (*Validator)(nil)
 	_ caddy.Provisioner           = (*Validator)(nil)
 	_ caddy.Validator             = (*Validator)(nil)
+	_ caddyfile.Unmarshaler       = (*Validator)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Validator)(nil)
 )

@@ -188,7 +188,7 @@ github.com/google/go-cmp/cmp/internal/value
 github.com/google/uuid
 # github.com/googleapis/gax-go/v2 v2.0.5
 github.com/googleapis/gax-go/v2
-# github.com/hslatman/caddy-openapi-validator v0.0.0-20200830200904-a0abbb209f14
+# github.com/hslatman/caddy-openapi-validator v0.0.0-20200904110527-47df8a5025b7
 ## explicit
 github.com/hslatman/caddy-openapi-validator
 # github.com/huandu/xstrings v1.3.1
