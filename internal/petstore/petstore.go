@@ -16,8 +16,6 @@ package petstore
 
 import (
 	"encoding/json"
-	"fmt"
-	"math"
 	"net/http"
 	"strconv"
 
@@ -33,8 +31,9 @@ func init() {
 
 // PetStore struct keeping module data
 type PetStore struct {
-	router *mux.Router
-	pets   map[int]*pet
+	router    *mux.Router
+	pets      map[int]*pet
+	currentID int
 }
 
 type pet struct {
@@ -55,22 +54,19 @@ func (PetStore) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the Petstore API
 func (p *PetStore) Provision(ctx caddy.Context) error {
 
-	r := mux.NewRouter()
-	api := r.PathPrefix("/api").Subrouter()
+	p.router = mux.NewRouter()
+	api := p.router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/pets", p.getPetsHandler).Methods(http.MethodGet)
 	api.HandleFunc("/pets", p.postPetsHandler).Methods(http.MethodPost)
 	api.HandleFunc("/pets/{id}", p.getPetHandler).Methods(http.MethodGet)
 
-	p.router = r
+	p.currentID = 1
 
 	p.pets = make(map[int]*pet)
-
-	pet1 := &pet{
-		ID:   1,
+	p.pets[p.currentID] = &pet{
+		ID:   p.currentID,
 		Name: "Pet 1",
 	}
-
-	p.pets[1] = pet1
 
 	return nil
 }
@@ -88,7 +84,6 @@ func (p *PetStore) getPetsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *PetStore) postPetsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("post pets handler called")
 
 	decoder := json.NewDecoder(r.Body)
 
@@ -99,9 +94,9 @@ func (p *PetStore) postPetsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newID := max(p.pets) + 1
-	t.ID = newID
-	p.pets[newID] = &t
+	p.currentID = p.currentID + 1
+	t.ID = p.currentID
+	p.pets[p.currentID] = &t
 
 	w.WriteHeader(http.StatusCreated)
 }
@@ -128,16 +123,6 @@ func (p *PetStore) getPetHandler(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(pet)
 	w.WriteHeader(http.StatusOK)
-}
-
-func max(numbers map[int]*pet) int {
-	m := math.MinInt32
-	for n := range numbers {
-		if n > m {
-			m = n
-		}
-	}
-	return m
 }
 
 // ServeHTTP serves a simple (and currently incomplete) Pet Store API
