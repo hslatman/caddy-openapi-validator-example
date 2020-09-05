@@ -16,7 +16,12 @@ package petstore
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
+	"strconv"
+
+	"github.com/gorilla/mux"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -28,6 +33,8 @@ func init() {
 
 // PetStore struct keeping module data
 type PetStore struct {
+	router *mux.Router
+	pets   map[int]*pet
 }
 
 type pet struct {
@@ -45,20 +52,103 @@ func (PetStore) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// Provision sets up the Petstore API
+func (p *PetStore) Provision(ctx caddy.Context) error {
+
+	r := mux.NewRouter()
+	api := r.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/pets", p.getPetsHandler).Methods(http.MethodGet)
+	api.HandleFunc("/pets", p.postPetsHandler).Methods(http.MethodPost)
+	api.HandleFunc("/pets/{id}", p.getPetHandler).Methods(http.MethodGet)
+
+	p.router = r
+
+	p.pets = make(map[int]*pet)
+
+	pet1 := &pet{
+		ID:   1,
+		Name: "Pet 1",
+	}
+
+	p.pets[1] = pet1
+
+	return nil
+}
+
+func (p *PetStore) getPetsHandler(w http.ResponseWriter, r *http.Request) {
+
+	pets := []pet{}
+	for _, v := range p.pets {
+		pets = append(pets, *v)
+	}
+
+	json.NewEncoder(w).Encode(pets)
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (p *PetStore) postPetsHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("post pets handler called")
+
+	decoder := json.NewDecoder(r.Body)
+
+	var t pet
+	err := decoder.Decode(&t)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	newID := max(p.pets) + 1
+	t.ID = newID
+	p.pets[newID] = &t
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (p *PetStore) getPetHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, ok := vars["id"]
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	iid, err := strconv.Atoi(id)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest) // TODO: adapt petstore.yaml to allow 404s?
+		return
+	}
+
+	pet, ok := p.pets[iid]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(pet)
+	w.WriteHeader(http.StatusOK)
+}
+
+func max(numbers map[int]*pet) int {
+	m := math.MinInt32
+	for n := range numbers {
+		if n > m {
+			m = n
+		}
+	}
+	return m
+}
+
 // ServeHTTP serves a simple (and currently incomplete) Pet Store API
 func (p *PetStore) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 
-	// TODO: provide a bit more realistic data that actually conforms to the OpenAPI specification?
+	// Set the default response content type
 	w.Header().Set("Content-Type", "application/json")
 
-	pet1 := pet{
-		ID:   1,
-		Name: "Pet 1",
-		//Additional: "this should trigger an error",
-	}
-	json.NewEncoder(w).Encode(pet1)
+	// Call the Gorilla Mux ServeHTTP to match and execute a route
+	p.router.ServeHTTP(w, r)
 
-	w.WriteHeader(200)
-
+	// Continue to the next handler in the Caddy stack (if it exists)
 	return next.ServeHTTP(w, r)
 }

@@ -28,7 +28,8 @@
                 "handle": [
                   {
                     "handler": "openapi_validator",
-                    "filepath": "examples/petstore.yaml"
+                    "filepath": "examples/petstore.yaml",
+                    "enforce": false
                   },
                   {
                     "handler": "petstore_api_example"
