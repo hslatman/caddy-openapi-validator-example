@@ -40,7 +40,6 @@ type pet struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
 	Tag  string `json:"tag,omitempty"`
-	//Additional string `json:"additional"`
 }
 
 // CaddyModule defines the PetStore module
@@ -77,6 +76,8 @@ func (p *PetStore) getPetsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, v := range p.pets {
 		pets = append(pets, *v)
 	}
+
+	// TODO: additional query params (i.e. limit)
 
 	json.NewEncoder(w).Encode(pets)
 
