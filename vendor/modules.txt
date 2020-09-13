@@ -116,7 +116,7 @@ github.com/dlclark/regexp2/syntax
 github.com/dustin/go-humanize
 # github.com/francoispqt/gojay v1.2.13
 github.com/francoispqt/gojay
-# github.com/getkin/kin-openapi v0.20.0
+# github.com/getkin/kin-openapi v0.22.0
 github.com/getkin/kin-openapi/jsoninfo
 github.com/getkin/kin-openapi/openapi3
 github.com/getkin/kin-openapi/openapi3filter
@@ -191,7 +191,7 @@ github.com/googleapis/gax-go/v2
 # github.com/gorilla/mux v1.8.0
 ## explicit
 github.com/gorilla/mux
-# github.com/hslatman/caddy-openapi-validator v0.0.0-20200911113213-25e1d61ff343
+# github.com/hslatman/caddy-openapi-validator v0.0.0-20200911130413-bf68d7737316
 ## explicit
 github.com/hslatman/caddy-openapi-validator
 # github.com/huandu/xstrings v1.3.1
