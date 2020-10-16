@@ -372,6 +372,8 @@ github.com/hslatman/caddy-openapi-validator v0.0.0-20200911113213-25e1d61ff343 h
 github.com/hslatman/caddy-openapi-validator v0.0.0-20200911113213-25e1d61ff343/go.mod h1:9bY+VEEiRmZK5E6O20FQnhBR3sW8e8oGCDO8c3ZjLeA=
 github.com/hslatman/caddy-openapi-validator v0.0.0-20200911130413-bf68d7737316 h1:sCKxQZUnNNTJiFZ0ft7CiVmZMTeaB/ZbZnYqTwE/nsk=
 github.com/hslatman/caddy-openapi-validator v0.0.0-20200911130413-bf68d7737316/go.mod h1:k4hB/znvieoH2dqRQv1aFC4+pVy7JrPaXXNwDDMNNPk=
+github.com/hslatman/caddy-openapi-validator v0.0.0-20201016151455-b4df816a045c h1:Q3hCoiUvJ3wcwhPUDuDqM9IxdIGjO5MBjTTIFD0cKTo=
+github.com/hslatman/caddy-openapi-validator v0.0.0-20201016151455-b4df816a045c/go.mod h1:k4hB/znvieoH2dqRQv1aFC4+pVy7JrPaXXNwDDMNNPk=
 github.com/huandu/xstrings v1.2.0/go.mod h1:DvyZB1rfVYsBIigL8HwpZgxHwXozlTgGqn63UyNX5k4=
 github.com/huandu/xstrings v1.3.1 h1:4jgBlKK6tLKFvO8u5pmYjG91cqytmDCDvGh7ECVFfFs=
 github.com/huandu/xstrings v1.3.1/go.mod h1:y5/lhBue+AyNmUVz9RLU9xbLR0o4KIIExikq4ovT0aE=
