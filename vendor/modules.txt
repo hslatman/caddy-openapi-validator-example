@@ -146,6 +146,7 @@ github.com/go-acme/lego/v3/log
 github.com/go-acme/lego/v3/platform/wait
 github.com/go-acme/lego/v3/registration
 # github.com/go-chi/chi v4.1.2+incompatible
+## explicit
 github.com/go-chi/chi
 # github.com/go-sql-driver/mysql v1.5.0
 github.com/go-sql-driver/mysql
@@ -196,7 +197,7 @@ github.com/googleapis/gax-go/v2
 # github.com/gorilla/mux v1.8.0
 ## explicit
 github.com/gorilla/mux
-# github.com/hslatman/caddy-openapi-validator v0.0.0-20201016151455-b4df816a045c
+# github.com/hslatman/caddy-openapi-validator v0.0.0-20201018110739-a3d04bc0bde3
 ## explicit
 github.com/hslatman/caddy-openapi-validator
 # github.com/huandu/xstrings v1.3.1
