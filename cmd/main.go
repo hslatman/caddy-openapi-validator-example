@@ -18,8 +18,8 @@ import (
 	cmd "github.com/caddyserver/caddy/v2/cmd"
 
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
-	_ "github.com/hslatman/caddy-openapi-validator-example/internal/petstore"
 	_ "github.com/hslatman/caddy-openapi-validator"
+	_ "github.com/hslatman/caddy-openapi-validator-example/internal/petstore"
 )
 
 func main() {
