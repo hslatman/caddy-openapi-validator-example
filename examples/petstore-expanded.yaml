@@ -13,8 +13,6 @@ info:
     url: https://www.apache.org/licenses/LICENSE-2.0.html
 servers:
   - url: http://petstore.swagger.io/api
-  - url: https://localhost:9443/api
-    description: "For local development, testing and demo purposes"
 paths:
   /pets:
     get:

@@ -28,7 +28,7 @@ func init() {
 	caddy.RegisterModule(ExpandedPetStore{})
 }
 
-// ExpandedPetStore struct keeping module data
+// ExpandedPetStore struct keeps module data
 type ExpandedPetStore struct {
 	handler http.Handler
 }
@@ -56,19 +56,19 @@ func (p *ExpandedPetStore) Provision(ctx caddy.Context) error {
 
 	// Add some pets
 	ps.NextId = 1
-	var pet api.Pet
-	pet.Name = "Pet One"
-	pet.Tag = nil
-	pet.Id = ps.NextId
+	var one api.Pet
+	one.Name = "Pet One"
+	one.Tag = nil
+	one.Id = ps.NextId
 	ps.NextId = ps.NextId + 1
-	ps.Pets[pet.Id] = pet
+	ps.Pets[one.Id] = one
 
-	var pet2 api.Pet
-	pet2.Name = "Pet Two"
-	pet2.Tag = nil
-	pet2.Id = ps.NextId
+	var two api.Pet
+	two.Name = "Pet Two"
+	two.Tag = nil
+	two.Id = ps.NextId
 	ps.NextId = ps.NextId + 1
-	ps.Pets[pet2.Id] = pet2
+	ps.Pets[two.Id] = two
 
 	return nil
 

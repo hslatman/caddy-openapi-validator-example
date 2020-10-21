@@ -112,7 +112,7 @@ func (p *PetStore) getPetHandler(w http.ResponseWriter, r *http.Request) {
 
 	iid, err := strconv.Atoi(id)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest) // TODO: adapt petstore.yaml to allow 404s?
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 

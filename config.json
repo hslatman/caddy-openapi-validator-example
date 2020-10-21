@@ -29,10 +29,20 @@
                   {
                     "handler": "openapi_validator",
                     "filepath": "examples/petstore.yaml",
-                    "enforce": false
+                    "additional_servers": [
+                      "https://localhost:9443/api"
+                    ]
                   },
                   {
                     "handler": "petstore_api_example"
+                  },
+                  {
+                    "handler": "headers",
+                    "response": {
+                      "set": {
+                        "Server": ["caddy-openapi-validator-example"]
+                      }
+                    }
                   }
                 ]
               }
