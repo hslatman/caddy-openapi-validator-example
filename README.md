@@ -18,17 +18,10 @@ $ go run cmd/main.go run --config=config.json
 
 # compile and run the server
 $ go build cmd/main.go
-$ ./main run --config config.json
+$ ./main run --config=config.json
 
 # run with the expanded pet store example
 $ go run cmd/main.go run --config=expanded.json
 ```
 
 The API can then be accessed like https://localhost:9443/api/pets/1. 
-
-## TODO
-
-A small and incomplete list of things to add:
-
-* Add more configurations?
-* Improve the example with more realistic and correct handlers

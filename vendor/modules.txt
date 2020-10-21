@@ -197,7 +197,7 @@ github.com/googleapis/gax-go/v2
 # github.com/gorilla/mux v1.8.0
 ## explicit
 github.com/gorilla/mux
-# github.com/hslatman/caddy-openapi-validator v0.0.0-20201018110739-a3d04bc0bde3
+# github.com/hslatman/caddy-openapi-validator v0.0.0-20201018190752-be42b22fa465
 ## explicit
 github.com/hslatman/caddy-openapi-validator
 # github.com/huandu/xstrings v1.3.1
