@@ -19,7 +19,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/gorilla/mux"
+	"github.com/go-chi/chi/v5"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -31,7 +31,7 @@ func init() {
 
 // PetStore struct keeping module data
 type PetStore struct {
-	router    *mux.Router
+	handler   http.Handler
 	pets      map[int]*pet
 	currentID int
 }
@@ -52,13 +52,14 @@ func (PetStore) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the Petstore API
 func (p *PetStore) Provision(ctx caddy.Context) error {
+	api := chi.NewRouter()
+	api.Get("/pets", p.getPetsHandler)
+	api.Post("/pets", p.postPetsHandler)
+	api.Get("/pets/{id}", p.getPetHandler)
 
-	p.router = mux.NewRouter()
-	api := p.router.PathPrefix("/api").Subrouter()
-	api.HandleFunc("/pets", p.getPetsHandler).Methods(http.MethodGet)
-	api.HandleFunc("/pets", p.postPetsHandler).Methods(http.MethodPost)
-	api.HandleFunc("/pets/{id}", p.getPetHandler).Methods(http.MethodGet)
-
+	r := chi.NewRouter()
+	r.Mount("/api", api)
+	p.handler = r
 	p.currentID = 1
 
 	p.pets = make(map[int]*pet)
@@ -71,7 +72,6 @@ func (p *PetStore) Provision(ctx caddy.Context) error {
 }
 
 func (p *PetStore) getPetsHandler(w http.ResponseWriter, r *http.Request) {
-
 	pets := []pet{}
 	for _, v := range p.pets {
 		pets = append(pets, *v)
@@ -85,7 +85,6 @@ func (p *PetStore) getPetsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *PetStore) postPetsHandler(w http.ResponseWriter, r *http.Request) {
-
 	decoder := json.NewDecoder(r.Body)
 
 	var t pet
@@ -103,9 +102,8 @@ func (p *PetStore) postPetsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *PetStore) getPetHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id, ok := vars["id"]
-	if !ok {
+	id := chi.URLParam(r, "id")
+	if id == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -132,8 +130,8 @@ func (p *PetStore) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Set the default response content type
 	w.Header().Set("Content-Type", "application/json")
 
-	// Call the Gorilla Mux ServeHTTP to match and execute a route
-	p.router.ServeHTTP(w, r)
+	// Call the Chi handler ServeHTTP method to match and execute a route
+	p.handler.ServeHTTP(w, r)
 
 	// Continue to the next handler in the Caddy stack (if it exists)
 	return next.ServeHTTP(w, r)

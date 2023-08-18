@@ -19,7 +19,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 
 	api "github.com/deepmap/oapi-codegen/examples/petstore-expanded/chi/api"
 )
@@ -49,10 +49,9 @@ func (p *ExpandedPetStore) Provision(ctx caddy.Context) error {
 	ps := api.NewPetStore()
 	handler := api.Handler(ps)
 
-	r := chi.NewRouter()
-	r.Mount("/api", handler)
-
-	p.handler = r
+	m := chi.NewRouter()
+	m.Mount("/api", handler)
+	p.handler = m
 
 	// Add some pets
 	ps.NextId = 1
