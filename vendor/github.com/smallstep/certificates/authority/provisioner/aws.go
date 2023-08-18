@@ -24,7 +24,6 @@ import (
 	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/webhook"
 )
 
 // awsIssuer is the string used as issuer in the generated tokens.
@@ -522,11 +521,7 @@ func (p *AWS) AuthorizeSign(_ context.Context, token string) ([]SignOption, erro
 		commonNameValidator(payload.Claims.Subject),
 		newValidityValidator(p.ctl.Claimer.MinTLSCertDuration(), p.ctl.Claimer.MaxTLSCertDuration()),
 		newX509NamePolicyValidator(p.ctl.getPolicy().getX509()),
-		p.ctl.newWebhookController(
-			data,
-			linkedca.Webhook_X509,
-			webhook.WithAuthorizationPrincipal(doc.InstanceID),
-		),
+		p.ctl.newWebhookController(data, linkedca.Webhook_X509),
 	), nil
 }
 
@@ -809,10 +804,6 @@ func (p *AWS) AuthorizeSSHSign(_ context.Context, token string) ([]SignOption, e
 		// Ensure that all principal names are allowed
 		newSSHNamePolicyValidator(p.ctl.getPolicy().getSSHHost(), nil),
 		// Call webhooks
-		p.ctl.newWebhookController(
-			data,
-			linkedca.Webhook_SSH,
-			webhook.WithAuthorizationPrincipal(doc.InstanceID),
-		),
+		p.ctl.newWebhookController(data, linkedca.Webhook_SSH),
 	), nil
 }

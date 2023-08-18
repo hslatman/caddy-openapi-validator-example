@@ -20,7 +20,6 @@ import (
 	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/webhook"
 )
 
 // azureOIDCBaseURL is the base discovery url for Microsoft Azure tokens.
@@ -404,11 +403,7 @@ func (p *Azure) AuthorizeSign(_ context.Context, token string) ([]SignOption, er
 		defaultPublicKeyValidator{},
 		newValidityValidator(p.ctl.Claimer.MinTLSCertDuration(), p.ctl.Claimer.MaxTLSCertDuration()),
 		newX509NamePolicyValidator(p.ctl.getPolicy().getX509()),
-		p.ctl.newWebhookController(
-			data,
-			linkedca.Webhook_X509,
-			webhook.WithAuthorizationPrincipal(identityObjectID),
-		),
+		p.ctl.newWebhookController(data, linkedca.Webhook_X509),
 	), nil
 }
 
@@ -426,7 +421,7 @@ func (p *Azure) AuthorizeSSHSign(_ context.Context, token string) ([]SignOption,
 		return nil, errs.Unauthorized("azure.AuthorizeSSHSign; sshCA is disabled for provisioner '%s'", p.GetName())
 	}
 
-	_, name, _, _, identityObjectID, err := p.authorizeToken(token)
+	_, name, _, _, _, err := p.authorizeToken(token)
 	if err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "azure.AuthorizeSSHSign")
 	}
@@ -478,11 +473,7 @@ func (p *Azure) AuthorizeSSHSign(_ context.Context, token string) ([]SignOption,
 		// Ensure that all principal names are allowed
 		newSSHNamePolicyValidator(p.ctl.getPolicy().getSSHHost(), nil),
 		// Call webhooks
-		p.ctl.newWebhookController(
-			data,
-			linkedca.Webhook_SSH,
-			webhook.WithAuthorizationPrincipal(identityObjectID),
-		),
+		p.ctl.newWebhookController(data, linkedca.Webhook_SSH),
 	), nil
 }
 

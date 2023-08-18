@@ -1,4 +1,4 @@
-//go:generate go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen --package=api --generate types,chi-server,spec -o petstore.gen.go ../../petstore-expanded.yaml
+//go:generate go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen --config=cfg.yaml ../../petstore-expanded.yaml
 
 package api
 
@@ -15,6 +15,10 @@ type PetStore struct {
 	Lock   sync.Mutex
 }
 
+// Make sure we conform to ServerInterface
+
+var _ ServerInterface = (*PetStore)(nil)
+
 func NewPetStore() *PetStore {
 	return &PetStore{
 		Pets:   make(map[int64]Pet),
@@ -22,9 +26,9 @@ func NewPetStore() *PetStore {
 	}
 }
 
-// This function wraps sending of an error in the Error format, and
+// sendPetStoreError wraps sending of an error in the Error format, and
 // handling the failure to marshal that.
-func sendPetstoreError(w http.ResponseWriter, code int, message string) {
+func sendPetStoreError(w http.ResponseWriter, code int, message string) {
 	petErr := Error{
 		Code:    int32(code),
 		Message: message,
@@ -33,7 +37,7 @@ func sendPetstoreError(w http.ResponseWriter, code int, message string) {
 	json.NewEncoder(w).Encode(petErr)
 }
 
-// Here, we implement all of the handlers in the ServerInterface
+// FindPets implements all the handlers in the ServerInterface
 func (p *PetStore) FindPets(w http.ResponseWriter, r *http.Request, params FindPetsParams) {
 	p.Lock.Lock()
 	defer p.Lock.Unlock()
@@ -70,7 +74,7 @@ func (p *PetStore) AddPet(w http.ResponseWriter, r *http.Request) {
 	// We expect a NewPet object in the request body.
 	var newPet NewPet
 	if err := json.NewDecoder(r.Body).Decode(&newPet); err != nil {
-		sendPetstoreError(w, http.StatusBadRequest, "Invalid format for NewPet")
+		sendPetStoreError(w, http.StatusBadRequest, "Invalid format for NewPet")
 		return
 	}
 
@@ -85,7 +89,7 @@ func (p *PetStore) AddPet(w http.ResponseWriter, r *http.Request) {
 	pet.Name = newPet.Name
 	pet.Tag = newPet.Tag
 	pet.Id = p.NextId
-	p.NextId = p.NextId + 1
+	p.NextId++
 
 	// Insert into map
 	p.Pets[pet.Id] = pet
@@ -95,13 +99,13 @@ func (p *PetStore) AddPet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(pet)
 }
 
-func (p *PetStore) FindPetById(w http.ResponseWriter, r *http.Request, id int64) {
+func (p *PetStore) FindPetByID(w http.ResponseWriter, r *http.Request, id int64) {
 	p.Lock.Lock()
 	defer p.Lock.Unlock()
 
 	pet, found := p.Pets[id]
 	if !found {
-		sendPetstoreError(w, http.StatusNotFound, fmt.Sprintf("Could not find pet with ID %d", id))
+		sendPetStoreError(w, http.StatusNotFound, fmt.Sprintf("Could not find pet with ID %d", id))
 		return
 	}
 
@@ -115,7 +119,7 @@ func (p *PetStore) DeletePet(w http.ResponseWriter, r *http.Request, id int64) {
 
 	_, found := p.Pets[id]
 	if !found {
-		sendPetstoreError(w, http.StatusNotFound, fmt.Sprintf("Could not find pet with ID %d", id))
+		sendPetStoreError(w, http.StatusNotFound, fmt.Sprintf("Could not find pet with ID %d", id))
 		return
 	}
 	delete(p.Pets, id)

@@ -21,7 +21,6 @@ import (
 	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/webhook"
 )
 
 // gcpCertsURL is the url that serves Google OAuth2 public keys.
@@ -276,11 +275,7 @@ func (p *GCP) AuthorizeSign(_ context.Context, token string) ([]SignOption, erro
 		defaultPublicKeyValidator{},
 		newValidityValidator(p.ctl.Claimer.MinTLSCertDuration(), p.ctl.Claimer.MaxTLSCertDuration()),
 		newX509NamePolicyValidator(p.ctl.getPolicy().getX509()),
-		p.ctl.newWebhookController(
-			data,
-			linkedca.Webhook_X509,
-			webhook.WithAuthorizationPrincipal(ce.InstanceID),
-		),
+		p.ctl.newWebhookController(data, linkedca.Webhook_X509),
 	), nil
 }
 
@@ -447,10 +442,6 @@ func (p *GCP) AuthorizeSSHSign(_ context.Context, token string) ([]SignOption, e
 		// Ensure that all principal names are allowed
 		newSSHNamePolicyValidator(p.ctl.getPolicy().getSSHHost(), nil),
 		// Call webhooks
-		p.ctl.newWebhookController(
-			data,
-			linkedca.Webhook_SSH,
-			webhook.WithAuthorizationPrincipal(ce.InstanceID),
-		),
+		p.ctl.newWebhookController(data, linkedca.Webhook_SSH),
 	), nil
 }
