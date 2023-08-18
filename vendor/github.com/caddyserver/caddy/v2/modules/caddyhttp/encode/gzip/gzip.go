@@ -15,14 +15,14 @@
 package caddygzip
 
 import (
-	"compress/flate"
 	"fmt"
 	"strconv"
+
+	"github.com/klauspost/compress/gzip"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/encode"
-	"github.com/klauspost/compress/gzip"
 )
 
 func init() {
@@ -68,11 +68,11 @@ func (g *Gzip) Provision(ctx caddy.Context) error {
 
 // Validate validates g's configuration.
 func (g Gzip) Validate() error {
-	if g.Level < flate.NoCompression {
-		return fmt.Errorf("quality too low; must be >= %d", flate.NoCompression)
+	if g.Level < gzip.StatelessCompression {
+		return fmt.Errorf("quality too low; must be >= %d", gzip.StatelessCompression)
 	}
-	if g.Level > flate.BestCompression {
-		return fmt.Errorf("quality too high; must be <= %d", flate.BestCompression)
+	if g.Level > gzip.BestCompression {
+		return fmt.Errorf("quality too high; must be <= %d", gzip.BestCompression)
 	}
 	return nil
 }

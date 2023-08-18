@@ -19,10 +19,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/buffer"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -87,10 +90,70 @@ func (fe *FilterEncoder) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return fmt.Errorf("loading log filter modules: %v", err)
 	}
-	for fieldName, modIface := range vals.(map[string]interface{}) {
+	for fieldName, modIface := range vals.(map[string]any) {
 		fe.Fields[fieldName] = modIface.(LogFieldFilter)
 	}
 
+	return nil
+}
+
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
+//
+//	filter {
+//	    wrap <another encoder>
+//	    fields {
+//	        <field> <filter> {
+//	            <filter options>
+//	        }
+//	    }
+//	}
+func (fe *FilterEncoder) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "wrap":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				moduleName := d.Val()
+				moduleID := "caddy.logging.encoders." + moduleName
+				unm, err := caddyfile.UnmarshalModule(d, moduleID)
+				if err != nil {
+					return err
+				}
+				enc, ok := unm.(zapcore.Encoder)
+				if !ok {
+					return d.Errf("module %s (%T) is not a zapcore.Encoder", moduleID, unm)
+				}
+				fe.WrappedRaw = caddyconfig.JSONModuleObject(enc, "format", moduleName, nil)
+
+			case "fields":
+				for d.NextBlock(1) {
+					field := d.Val()
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					filterName := d.Val()
+					moduleID := "caddy.logging.encoders.filter." + filterName
+					unm, err := caddyfile.UnmarshalModule(d, moduleID)
+					if err != nil {
+						return err
+					}
+					filter, ok := unm.(LogFieldFilter)
+					if !ok {
+						return d.Errf("module %s (%T) is not a logging.LogFieldFilter", moduleID, unm)
+					}
+					if fe.FieldsRaw == nil {
+						fe.FieldsRaw = make(map[string]json.RawMessage)
+					}
+					fe.FieldsRaw[field] = caddyconfig.JSONModuleObject(filter, "filter", filterName, nil)
+				}
+
+			default:
+				return d.Errf("unrecognized subdirective %s", d.Val())
+			}
+		}
+	}
 	return nil
 }
 
@@ -264,7 +327,7 @@ func (fe FilterEncoder) AddUintptr(key string, value uintptr) {
 }
 
 // AddReflected is part of the zapcore.ObjectEncoder interface.
-func (fe FilterEncoder) AddReflected(key string, value interface{}) error {
+func (fe FilterEncoder) AddReflected(key string, value any) error {
 	if !fe.filtered(key, value) {
 		return fe.wrapped.AddReflected(key, value)
 	}
@@ -305,7 +368,7 @@ func (fe FilterEncoder) EncodeEntry(ent zapcore.Entry, fields []zapcore.Field) (
 // added to the underlying encoder (so do not do
 // that again). If false was returned, the field has
 // not yet been added to the underlying encoder.
-func (fe FilterEncoder) filtered(key string, value interface{}) bool {
+func (fe FilterEncoder) filtered(key string, value any) bool {
 	filter, ok := fe.Fields[fe.keyPrefix+key]
 	if !ok {
 		return false
@@ -330,4 +393,5 @@ func (mom logObjectMarshalerWrapper) MarshalLogObject(_ zapcore.ObjectEncoder) e
 var (
 	_ zapcore.Encoder         = (*FilterEncoder)(nil)
 	_ zapcore.ObjectMarshaler = (*logObjectMarshalerWrapper)(nil)
+	_ caddyfile.Unmarshaler   = (*FilterEncoder)(nil)
 )

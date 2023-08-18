@@ -22,10 +22,11 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/dustin/go-humanize"
 	"gopkg.in/natefinch/lumberjack.v2"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -126,20 +127,25 @@ func (fw FileWriter) OpenWriter() (io.WriteCloser, error) {
 	}
 
 	// otherwise just open a regular file
-	return os.OpenFile(fw.Filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+	return os.OpenFile(fw.Filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
 }
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
 //
-//     file <filename> {
-//         roll_disabled
-//         roll_size     <size>
-//         roll_keep     <num>
-//         roll_keep_for <days>
-//     }
+//	file <filename> {
+//	    roll_disabled
+//	    roll_size     <size>
+//	    roll_uncompressed
+//	    roll_local_time
+//	    roll_keep     <num>
+//	    roll_keep_for <days>
+//	}
 //
 // The roll_size value has megabyte resolution.
 // Fractional values are rounded up to the next whole megabyte (MiB).
+//
+// By default, compression is enabled, but can be turned off by setting
+// the roll_uncompressed option.
 //
 // The roll_keep_for duration has day resolution.
 // Fractional values are rounded up to the next whole number of days.
@@ -176,6 +182,19 @@ func (fw *FileWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("parsing size: %v", err)
 				}
 				fw.RollSizeMB = int(math.Ceil(float64(size) / humanize.MiByte))
+
+			case "roll_uncompressed":
+				var f bool
+				fw.RollCompress = &f
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+
+			case "roll_local_time":
+				fw.RollLocalTime = true
+				if d.NextArg() {
+					return d.ArgErr()
+				}
 
 			case "roll_keep":
 				var keepStr string

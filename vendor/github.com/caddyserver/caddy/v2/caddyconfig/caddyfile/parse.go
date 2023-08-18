@@ -1,4 +1,4 @@
-// Copyright 2015 Light Code Labs, LLC
+// Copyright 2015 Matthew Holt and The Caddy Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,13 @@ package caddyfile
 
 import (
 	"bytes"
-	"io/ioutil"
-	"log"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -36,16 +37,36 @@ import (
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
 // will be replaced before parsing begins.
 func Parse(filename string, input []byte) ([]ServerBlock, error) {
-	tokens, err := allTokens(filename, input)
+	// unfortunately, we must copy the input because parsing must
+	// remain a read-only operation, but we have to expand environment
+	// variables before we parse, which changes the underlying array (#4422)
+	inputCopy := make([]byte, len(input))
+	copy(inputCopy, input)
+
+	tokens, err := allTokens(filename, inputCopy)
 	if err != nil {
 		return nil, err
 	}
-	p := parser{Dispenser: NewDispenser(tokens)}
+	p := parser{
+		Dispenser: NewDispenser(tokens),
+		importGraph: importGraph{
+			nodes: make(map[string]bool),
+			edges: make(adjacency),
+		},
+	}
 	return p.parseAll()
 }
 
+// allTokens lexes the entire input, but does not parse it.
+// It returns all the tokens from the input, unstructured
+// and in order. It may mutate input as it expands env vars.
+func allTokens(filename string, input []byte) ([]Token, error) {
+	return Tokenize(replaceEnvVars(input), filename)
+}
+
 // replaceEnvVars replaces all occurrences of environment variables.
-func replaceEnvVars(input []byte) ([]byte, error) {
+// It mutates the underlying array and returns the updated slice.
+func replaceEnvVars(input []byte) []byte {
 	var offset int
 	for {
 		begin := bytes.Index(input[offset:], spanOpen)
@@ -60,44 +81,33 @@ func replaceEnvVars(input []byte) ([]byte, error) {
 		end += begin + len(spanOpen) // make end relative to input, not begin
 
 		// get the name; if there is no name, skip it
-		envVarName := input[begin+len(spanOpen) : end]
-		if len(envVarName) == 0 {
+		envString := input[begin+len(spanOpen) : end]
+		if len(envString) == 0 {
 			offset = end + len(spanClose)
 			continue
 		}
 
+		// split the string into a key and an optional default
+		envParts := strings.SplitN(string(envString), envVarDefaultDelimiter, 2)
+
+		// do a lookup for the env var, replace with the default if not found
+		envVarValue, found := os.LookupEnv(envParts[0])
+		if !found && len(envParts) == 2 {
+			envVarValue = envParts[1]
+		}
+
 		// get the value of the environment variable
-		envVarValue := []byte(os.ExpandEnv(os.Getenv(string(envVarName))))
+		// note that this causes one-level deep chaining
+		envVarBytes := []byte(envVarValue)
 
 		// splice in the value
 		input = append(input[:begin],
-			append(envVarValue, input[end+len(spanClose):]...)...)
+			append(envVarBytes, input[end+len(spanClose):]...)...)
 
 		// continue at the end of the replacement
-		offset = begin + len(envVarValue)
+		offset = begin + len(envVarBytes)
 	}
-	return input, nil
-}
-
-// allTokens lexes the entire input, but does not parse it.
-// It returns all the tokens from the input, unstructured
-// and in order.
-func allTokens(filename string, input []byte) ([]Token, error) {
-	input, err := replaceEnvVars(input)
-	if err != nil {
-		return nil, err
-	}
-	l := new(lexer)
-	err = l.load(bytes.NewReader(input))
-	if err != nil {
-		return nil, err
-	}
-	var tokens []Token
-	for l.next() {
-		l.token.File = filename
-		tokens = append(tokens, l.token)
-	}
-	return tokens, nil
+	return input
 }
 
 type parser struct {
@@ -106,6 +116,7 @@ type parser struct {
 	eof             bool        // if we encounter a valid EOF in a hard place
 	definedSnippets map[string][]Token
 	nesting         int
+	importGraph     importGraph
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -138,7 +149,6 @@ func (p *parser) begin() error {
 	}
 
 	err := p.addresses()
-
 	if err != nil {
 		return err
 	}
@@ -146,6 +156,25 @@ func (p *parser) begin() error {
 	if p.eof {
 		// this happens if the Caddyfile consists of only
 		// a line of addresses and nothing else
+		return nil
+	}
+
+	if ok, name := p.isNamedRoute(); ok {
+		// named routes only have one key, the route name
+		p.block.Keys = []string{name}
+		p.block.IsNamedRoute = true
+
+		// we just need a dummy leading token to ease parsing later
+		nameToken := p.Token()
+		nameToken.Text = name
+
+		// get all the tokens from the block, including the braces
+		tokens, err := p.blockTokens(true)
+		if err != nil {
+			return err
+		}
+		tokens = append([]Token{nameToken}, tokens...)
+		p.block.Segments = []Segment{tokens}
 		return nil
 	}
 
@@ -157,9 +186,17 @@ func (p *parser) begin() error {
 			return p.Errf("redeclaration of previously declared snippet %s", name)
 		}
 		// consume all tokens til matched close brace
-		tokens, err := p.snippetTokens()
+		tokens, err := p.blockTokens(false)
 		if err != nil {
 			return err
+		}
+		// Just as we need to track which file the token comes from, we need to
+		// keep track of which snippet the token comes from. This is helpful
+		// in tracking import cycles across files/snippets by namespacing them.
+		// Without this, we end up with false-positives in cycle-detection.
+		for k, v := range tokens {
+			v.snippetName = name
+			tokens[k] = v
 		}
 		p.definedSnippets[name] = tokens
 		// empty block keys so we don't save this block as a real server.
@@ -178,7 +215,7 @@ func (p *parser) addresses() error {
 
 		// special case: import directive replaces tokens during parse-time
 		if tkn == "import" && p.isNewLine() {
-			err := p.doImport()
+			err := p.doImport(0)
 			if err != nil {
 				return err
 			}
@@ -190,7 +227,18 @@ func (p *parser) addresses() error {
 			if expectingAnother {
 				return p.Errf("Expected another address but had '%s' - check for extra comma", tkn)
 			}
+			// Mark this server block as being defined with braces.
+			// This is used to provide a better error message when
+			// the user may have tried to define two server blocks
+			// without having used braces, which are required in
+			// that case.
+			p.block.HasBraces = true
 			break
+		}
+
+		// Users commonly forget to place a space between the address and the '{'
+		if strings.HasSuffix(tkn, "{") {
+			return p.Errf("Site addresses cannot end with a curly brace: '%s' - put a space between the token and the brace", tkn)
 		}
 
 		if tkn != "" { // empty token possible if user typed ""
@@ -201,6 +249,13 @@ func (p *parser) addresses() error {
 				expectingAnother = true
 			} else {
 				expectingAnother = false // but we may still see another one on this line
+			}
+
+			// If there's a comma here, it's probably because they didn't use a space
+			// between their two domains, e.g. "foo.com,bar.com", which would not be
+			// parsed as two separate site addresses.
+			if strings.Contains(tkn, ",") {
+				return p.Errf("Site addresses cannot contain a comma ',': '%s' - put a space after the comma to separate site addresses", tkn)
 			}
 
 			p.block.Keys = append(p.block.Keys, tkn)
@@ -260,7 +315,7 @@ func (p *parser) directives() error {
 
 		// special case: import directive replaces tokens during parse-time
 		if p.Val() == "import" {
-			err := p.doImport()
+			err := p.doImport(1)
 			if err != nil {
 				return err
 			}
@@ -286,7 +341,7 @@ func (p *parser) directives() error {
 // is on the token before where the import directive was. In
 // other words, call Next() to access the first token that was
 // imported.
-func (p *parser) doImport() error {
+func (p *parser) doImport(nesting int) error {
 	// syntax checks
 	if !p.NextArg() {
 		return p.ArgErr()
@@ -299,21 +354,23 @@ func (p *parser) doImport() error {
 	// grab remaining args as placeholder replacements
 	args := p.RemainingArgs()
 
-	// add args to the replacer
-	repl := caddy.NewReplacer()
-	for index, arg := range args {
-		repl.Set("args."+strconv.Itoa(index), arg)
-	}
+	// set up a replacer for non-variadic args replacement
+	repl := makeArgsReplacer(args)
 
 	// splice out the import directive and its arguments
 	// (2 tokens, plus the length of args)
 	tokensBefore := p.tokens[:p.cursor-1-len(args)]
 	tokensAfter := p.tokens[p.cursor+1:]
 	var importedTokens []Token
+	var nodes []string
 
 	// first check snippets. That is a simple, non-recursive replacement
 	if p.definedSnippets != nil && p.definedSnippets[importPattern] != nil {
 		importedTokens = p.definedSnippets[importPattern]
+		if len(importedTokens) > 0 {
+			// just grab the first one
+			nodes = append(nodes, fmt.Sprintf("%s:%s", importedTokens[0].File, importedTokens[0].snippetName))
+		}
 	} else {
 		// make path relative to the file of the _token_ being processed rather
 		// than current working directory (issue #867) and then use glob to get
@@ -342,14 +399,27 @@ func (p *parser) doImport() error {
 		}
 		if len(matches) == 0 {
 			if strings.ContainsAny(globPattern, "*?[]") {
-				log.Printf("[WARNING] No files matching import glob pattern: %s", importPattern)
+				caddy.Log().Warn("No files matching import glob pattern", zap.String("pattern", importPattern))
 			} else {
 				return p.Errf("File to import not found: %s", importPattern)
+			}
+		} else {
+			// See issue #5295 - should skip any files that start with a . when iterating over them.
+			sep := string(filepath.Separator)
+			segGlobPattern := strings.Split(globPattern, sep)
+			if strings.HasPrefix(segGlobPattern[len(segGlobPattern)-1], "*") {
+				var tmpMatches []string
+				for _, m := range matches {
+					seg := strings.Split(m, sep)
+					if !strings.HasPrefix(seg[len(seg)-1], ".") {
+						tmpMatches = append(tmpMatches, m)
+					}
+				}
+				matches = tmpMatches
 			}
 		}
 
 		// collect all the imported tokens
-
 		for _, importFile := range matches {
 			newTokens, err := p.doSingleImport(importFile)
 			if err != nil {
@@ -357,16 +427,84 @@ func (p *parser) doImport() error {
 			}
 			importedTokens = append(importedTokens, newTokens...)
 		}
+		nodes = matches
+	}
+
+	nodeName := p.File()
+	if p.Token().snippetName != "" {
+		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
+	}
+	p.importGraph.addNode(nodeName)
+	p.importGraph.addNodes(nodes)
+	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
+		p.importGraph.removeNodes(nodes)
+		return err
 	}
 
 	// copy the tokens so we don't overwrite p.definedSnippets
-	tokensCopy := make([]Token, len(importedTokens))
-	copy(tokensCopy, importedTokens)
+	tokensCopy := make([]Token, 0, len(importedTokens))
+
+	var (
+		maybeSnippet   bool
+		maybeSnippetId bool
+		index          int
+	)
 
 	// run the argument replacer on the tokens
-	for index, token := range tokensCopy {
-		token.Text = repl.ReplaceKnown(token.Text, "")
-		tokensCopy[index] = token
+	// golang for range slice return a copy of value
+	// similarly, append also copy value
+	for i, token := range importedTokens {
+		// update the token's imports to refer to import directive filename, line number and snippet name if there is one
+		if token.snippetName != "" {
+			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import %s)", p.File(), p.Line(), token.snippetName))
+		} else {
+			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import)", p.File(), p.Line()))
+		}
+
+		// naive way of determine snippets, as snippets definition can only follow name + block
+		// format, won't check for nesting correctness or any other error, that's what parser does.
+		if !maybeSnippet && nesting == 0 {
+			// first of the line
+			if i == 0 || isNextOnNewLine(tokensCopy[i-1], token) {
+				index = 0
+			} else {
+				index++
+			}
+
+			if index == 0 && len(token.Text) >= 3 && strings.HasPrefix(token.Text, "(") && strings.HasSuffix(token.Text, ")") {
+				maybeSnippetId = true
+			}
+		}
+
+		switch token.Text {
+		case "{":
+			nesting++
+			if index == 1 && maybeSnippetId && nesting == 1 {
+				maybeSnippet = true
+				maybeSnippetId = false
+			}
+		case "}":
+			nesting--
+			if nesting == 0 && maybeSnippet {
+				maybeSnippet = false
+			}
+		}
+
+		if maybeSnippet {
+			tokensCopy = append(tokensCopy, token)
+			continue
+		}
+
+		foundVariadic, startIndex, endIndex := parseVariadic(token, len(args))
+		if foundVariadic {
+			for _, arg := range args[startIndex:endIndex] {
+				token.Text = arg
+				tokensCopy = append(tokensCopy, token)
+			}
+		} else {
+			token.Text = repl.ReplaceKnown(token.Text, "")
+			tokensCopy = append(tokensCopy, token)
+		}
 	}
 
 	// splice the imported tokens in the place of the import statement
@@ -392,9 +530,15 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 		return nil, p.Errf("Could not import %s: is a directory", importFile)
 	}
 
-	input, err := ioutil.ReadAll(file)
+	input, err := io.ReadAll(file)
 	if err != nil {
 		return nil, p.Errf("Could not read imported file %s: %v", importFile, err)
+	}
+
+	// only warning in case of empty files
+	if len(input) == 0 || len(strings.TrimSpace(string(input))) == 0 {
+		caddy.Log().Warn("Import file is empty", zap.String("file", importFile))
+		return []Token{}, nil
 	}
 
 	importedTokens, err := allTokens(importFile, input)
@@ -422,7 +566,6 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 // are loaded into the current server block for later use
 // by directive setup functions.
 func (p *parser) directive() error {
-
 	// a segment is a list of tokens associated with this directive
 	var segment Segment
 
@@ -432,6 +575,16 @@ func (p *parser) directive() error {
 	for p.Next() {
 		if p.Val() == "{" {
 			p.nesting++
+			if !p.isNextOnNewLine() && p.Token().wasQuoted == 0 {
+				return p.Err("Unexpected next token after '{' on same line")
+			}
+			if p.isNewLine() {
+				return p.Err("Unexpected '{' on a new line; did you mean to place the '{' on the previous line?")
+			}
+		} else if p.Val() == "{}" {
+			if p.isNextOnNewLine() && p.Token().wasQuoted == 0 {
+				return p.Err("Unexpected '{}' at end of line")
+			}
 		} else if p.isNewLine() && p.nesting == 0 {
 			p.cursor-- // read too far
 			break
@@ -440,7 +593,7 @@ func (p *parser) directive() error {
 		} else if p.Val() == "}" && p.nesting == 0 {
 			return p.Err("Unexpected '}' because no matching opening brace")
 		} else if p.Val() == "import" && p.isNewLine() {
-			if err := p.doImport(); err != nil {
+			if err := p.doImport(1); err != nil {
 				return err
 			}
 			p.cursor-- // cursor is advanced when we continue, so roll back one more
@@ -481,6 +634,15 @@ func (p *parser) closeCurlyBrace() error {
 	return nil
 }
 
+func (p *parser) isNamedRoute() (bool, string) {
+	keys := p.block.Keys
+	// A named route block is a single key with parens, prefixed with &.
+	if len(keys) == 1 && strings.HasPrefix(keys[0], "&(") && strings.HasSuffix(keys[0], ")") {
+		return true, strings.TrimSuffix(keys[0][2:], ")")
+	}
+	return false, ""
+}
+
 func (p *parser) isSnippet() (bool, string) {
 	keys := p.block.Keys
 	// A snippet block is a single key with parens. Nothing else qualifies.
@@ -491,18 +653,24 @@ func (p *parser) isSnippet() (bool, string) {
 }
 
 // read and store everything in a block for later replay.
-func (p *parser) snippetTokens() ([]Token, error) {
-	// snippet must have curlies.
+func (p *parser) blockTokens(retainCurlies bool) ([]Token, error) {
+	// block must have curlies.
 	err := p.openCurlyBrace()
 	if err != nil {
 		return nil, err
 	}
-	nesting := 1 // count our own nesting in snippets
+	nesting := 1 // count our own nesting
 	tokens := []Token{}
+	if retainCurlies {
+		tokens = append(tokens, p.Token())
+	}
 	for p.Next() {
 		if p.Val() == "}" {
 			nesting--
 			if nesting == 0 {
+				if retainCurlies {
+					tokens = append(tokens, p.Token())
+				}
 				break
 			}
 		}
@@ -522,8 +690,10 @@ func (p *parser) snippetTokens() ([]Token, error) {
 // head of the server block with tokens, which are
 // grouped by segments.
 type ServerBlock struct {
-	Keys     []string
-	Segments []Segment
+	HasBraces    bool
+	Keys         []string
+	Segments     []Segment
+	IsNamedRoute bool
 }
 
 // DispenseDirective returns a dispenser that contains
@@ -554,4 +724,7 @@ func (s Segment) Directive() string {
 
 // spanOpen and spanClose are used to bound spans that
 // contain the name of an environment variable.
-var spanOpen, spanClose = []byte{'{', '$'}, []byte{'}'}
+var (
+	spanOpen, spanClose    = []byte{'{', '$'}, []byte{'}'}
+	envVarDefaultDelimiter = ":"
+)

@@ -21,16 +21,16 @@ import (
 	"fmt"
 	weakrand "math/rand"
 	"net/http"
+	"strings"
 	"sync"
-	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
 	caddy.RegisterModule(HTTPBasicAuth{})
-
-	weakrand.Seed(time.Now().UnixNano())
 }
 
 // HTTPBasicAuth facilitates HTTP basic authentication.
@@ -52,11 +52,19 @@ type HTTPBasicAuth struct {
 	// memory for a longer time (this should not be a problem
 	// as long as your machine is not compromised, at which point
 	// all bets are off, since basicauth necessitates plaintext
-	// passwords being received over the wire anyway).
+	// passwords being received over the wire anyway). Note that
+	// a cache hit does not mean it is a valid password.
 	HashCache *Cache `json:"hash_cache,omitempty"`
 
 	Accounts map[string]Account `json:"-"`
 	Hash     Comparer           `json:"-"`
+
+	// fakePassword is used when a given user is not found,
+	// so that timing side-channels can be mitigated: it gives
+	// us something to hash and compare even if the user does
+	// not exist, which should have similar timing as a user
+	// account that does exist.
+	fakePassword []byte
 }
 
 // CaddyModule returns the Caddy module information.
@@ -84,6 +92,11 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("hash is required")
 	}
 
+	// if supported, generate a fake password we can compare against if needed
+	if hasher, ok := hba.Hash.(Hasher); ok {
+		hba.fakePassword = hasher.FakeHash()
+	}
+
 	repl := caddy.NewReplacer()
 
 	// load account list
@@ -101,10 +114,19 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("account %d: username and password are required", i)
 		}
 
-		acct.password, err = base64.StdEncoding.DecodeString(acct.Password)
-		if err != nil {
-			return fmt.Errorf("base64-decoding password: %v", err)
+		// TODO: Remove support for redundantly-encoded b64-encoded hashes
+		// Passwords starting with '$' are likely in Modular Crypt Format,
+		// so we don't need to base64 decode them. But historically, we
+		// required redundant base64, so we try to decode it otherwise.
+		if strings.HasPrefix(acct.Password, "$") {
+			acct.password = []byte(acct.Password)
+		} else {
+			acct.password, err = base64.StdEncoding.DecodeString(acct.Password)
+			if err != nil {
+				return fmt.Errorf("base64-decoding password: %v", err)
+			}
 		}
+
 		if acct.Salt != "" {
 			acct.salt, err = base64.StdEncoding.DecodeString(acct.Salt)
 			if err != nil {
@@ -118,7 +140,8 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 
 	if hba.HashCache != nil {
 		hba.HashCache.cache = make(map[string]bool)
-		hba.HashCache.mu = new(sync.Mutex)
+		hba.HashCache.mu = new(sync.RWMutex)
+		hba.HashCache.g = new(singleflight.Group)
 	}
 
 	return nil
@@ -132,15 +155,16 @@ func (hba HTTPBasicAuth) Authenticate(w http.ResponseWriter, req *http.Request) 
 	}
 
 	account, accountExists := hba.Accounts[username]
-	// don't return early if account does not exist; we want
-	// to try to avoid side-channels that leak existence
+	if !accountExists {
+		// don't return early if account does not exist; we want
+		// to try to avoid side-channels that leak existence, so
+		// we use a fake password to simulate realistic CPU cycles
+		account.password = hba.fakePassword
+	}
 
 	same, err := hba.correctPassword(account, []byte(plaintextPasswordStr))
-	if err != nil {
+	if err != nil || !same || !accountExists {
 		return hba.promptForCredentials(w, err)
-	}
-	if !same || !accountExists {
-		return hba.promptForCredentials(w, nil)
 	}
 
 	return User{ID: username}, true, nil
@@ -160,19 +184,24 @@ func (hba HTTPBasicAuth) correctPassword(account Account, plaintextPassword []by
 	cacheKey := hex.EncodeToString(append(append(account.password, account.salt...), plaintextPassword...))
 
 	// fast track: if the result of the input is already cached, use it
-	hba.HashCache.mu.Lock()
+	hba.HashCache.mu.RLock()
 	same, ok := hba.HashCache.cache[cacheKey]
+	hba.HashCache.mu.RUnlock()
 	if ok {
-		hba.HashCache.mu.Unlock()
 		return same, nil
 	}
-	hba.HashCache.mu.Unlock()
-
 	// slow track: do the expensive op, then add it to the cache
-	same, err := compare()
+	// but perform it in a singleflight group so that multiple
+	// parallel requests using the same password don't cause a
+	// thundering herd problem by all performing the same hashing
+	// operation before the first one finishes and caches it.
+	v, err, _ := hba.HashCache.g.Do(cacheKey, func() (any, error) {
+		return compare()
+	})
 	if err != nil {
 		return false, err
 	}
+	same = v.(bool)
 	hba.HashCache.mu.Lock()
 	if len(hba.HashCache.cache) >= 1000 {
 		hba.HashCache.makeRoom() // keep cache size under control
@@ -199,7 +228,8 @@ func (hba HTTPBasicAuth) promptForCredentials(w http.ResponseWriter, err error) 
 // helpful for secure password hashes which can be expensive to
 // compute on every HTTP request.
 type Cache struct {
-	mu *sync.Mutex
+	mu *sync.RWMutex
+	g  *singleflight.Group
 
 	// map of concatenated hashed password + plaintext password + salt, to result
 	cache map[string]bool
@@ -224,6 +254,7 @@ func (c *Cache) makeRoom() {
 		// map with less code, this is a heavily skewed eviction
 		// strategy; generating random numbers is cheap and
 		// ensures a much better distribution.
+		//nolint:gosec
 		rnd := weakrand.Intn(len(c.cache))
 		i := 0
 		for key := range c.cache {
@@ -247,6 +278,18 @@ type Comparer interface {
 	// false otherwise. An error is returned only if
 	// there is a technical/configuration error.
 	Compare(hashedPassword, plaintextPassword, salt []byte) (bool, error)
+}
+
+// Hasher is a type that can generate a secure hash
+// given a plaintext and optional salt (for algorithms
+// that require a salt). Hashing modules which implement
+// this interface can be used with the hash-password
+// subcommand as well as benefitting from anti-timing
+// features. A hasher also returns a fake hash which
+// can be used for timing side-channel mitigation.
+type Hasher interface {
+	Hash(plaintext, salt []byte) ([]byte, error)
+	FakeHash() []byte
 }
 
 // Account contains a username, password, and salt (if applicable).
