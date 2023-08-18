@@ -16,10 +16,12 @@ package caddyauth
 
 import (
 	"crypto/subtle"
+	"encoding/base64"
 
-	"github.com/caddyserver/caddy/v2"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/scrypt"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
@@ -50,7 +52,21 @@ func (BcryptHash) Compare(hashed, plaintext, _ []byte) (bool, error) {
 	return true, nil
 }
 
+// Hash hashes plaintext using a random salt.
+func (BcryptHash) Hash(plaintext, _ []byte) ([]byte, error) {
+	return bcrypt.GenerateFromPassword(plaintext, 14)
+}
+
+// FakeHash returns a fake hash.
+func (BcryptHash) FakeHash() []byte {
+	// hashed with the following command:
+	// caddy hash-password --plaintext "antitiming" --algorithm "bcrypt"
+	return []byte("$2a$14$X3ulqf/iGxnf1k6oMZ.RZeJUoqI9PX2PM4rS5lkIKJXduLGXGPrt6")
+}
+
 // ScryptHash implements the scrypt KDF as a hash.
+//
+// DEPRECATED, please use 'bcrypt' instead.
 type ScryptHash struct {
 	// scrypt's N parameter. If unset or 0, a safe default is used.
 	N int `json:"N,omitempty"`
@@ -75,8 +91,9 @@ func (ScryptHash) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision sets up s.
-func (s *ScryptHash) Provision(_ caddy.Context) error {
+func (s *ScryptHash) Provision(ctx caddy.Context) error {
 	s.SetDefaults()
+	ctx.Logger().Warn("use of 'scrypt' is deprecated, please use 'bcrypt' instead")
 	return nil
 }
 
@@ -113,6 +130,19 @@ func (s ScryptHash) Compare(hashed, plaintext, salt []byte) (bool, error) {
 	return false, nil
 }
 
+// Hash hashes plaintext using the given salt.
+func (s ScryptHash) Hash(plaintext, salt []byte) ([]byte, error) {
+	return scrypt.Key(plaintext, salt, s.N, s.R, s.P, s.KeyLength)
+}
+
+// FakeHash returns a fake hash.
+func (ScryptHash) FakeHash() []byte {
+	// hashed with the following command:
+	// caddy hash-password --plaintext "antitiming" --salt "fakesalt" --algorithm "scrypt"
+	bytes, _ := base64.StdEncoding.DecodeString("kFbjiVemlwK/ZS0tS6/UQqEDeaNMigyCs48KEsGUse8=")
+	return bytes
+}
+
 func hashesMatch(pwdHash1, pwdHash2 []byte) bool {
 	return subtle.ConstantTimeCompare(pwdHash1, pwdHash2) == 1
 }
@@ -121,5 +151,7 @@ func hashesMatch(pwdHash1, pwdHash2 []byte) bool {
 var (
 	_ Comparer          = (*BcryptHash)(nil)
 	_ Comparer          = (*ScryptHash)(nil)
+	_ Hasher            = (*BcryptHash)(nil)
+	_ Hasher            = (*ScryptHash)(nil)
 	_ caddy.Provisioner = (*ScryptHash)(nil)
 )

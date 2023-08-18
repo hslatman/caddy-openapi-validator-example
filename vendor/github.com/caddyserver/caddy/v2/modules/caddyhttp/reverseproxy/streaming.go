@@ -20,33 +20,60 @@ package reverseproxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	weakrand "math/rand"
+	"mime"
 	"net/http"
 	"sync"
 	"time"
+	"unsafe"
 
 	"go.uber.org/zap"
+	"golang.org/x/net/http/httpguts"
 )
 
-func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request, res *http.Response) {
+func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
-	if reqUpType != resUpType {
-		// TODO: figure out our own error handling
-		// p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch protocol %q when %q was requested", resUpType, reqUpType))
+
+	// Taken from https://github.com/golang/go/commit/5c489514bc5e61ad9b5b07bd7d8ec65d66a0512a
+	// We know reqUpType is ASCII, it's checked by the caller.
+	if !asciiIsPrint(resUpType) {
+		logger.Debug("backend tried to switch to invalid protocol",
+			zap.String("backend_upgrade", resUpType))
+		return
+	}
+	if !asciiEqualFold(reqUpType, resUpType) {
+		logger.Debug("backend tried to switch to unexpected protocol via Upgrade header",
+			zap.String("backend_upgrade", resUpType),
+			zap.String("requested_upgrade", reqUpType))
 		return
 	}
 
-	copyHeader(res.Header, rw.Header())
-
-	hj, ok := rw.(http.Hijacker)
-	if !ok {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("can't switch protocols using non-Hijacker ResponseWriter type %T", rw))
-		return
-	}
 	backConn, ok := res.Body.(io.ReadWriteCloser)
 	if !ok {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("internal error: 101 switching protocols response with non-writable body"))
+		logger.Error("internal error: 101 switching protocols response with non-writable body")
+		return
+	}
+
+	// write header first, response headers should not be counted in size
+	// like the rest of handler chain.
+	copyHeader(rw.Header(), res.Header)
+	rw.WriteHeader(res.StatusCode)
+
+	logger.Debug("upgrading connection")
+
+	//nolint:bodyclose
+	conn, brw, hijackErr := http.NewResponseController(rw).Hijack()
+	if errors.Is(hijackErr, http.ErrNotSupported) {
+		h.logger.Sugar().Errorf("can't switch protocols using non-Hijacker ResponseWriter type %T", rw)
+		return
+	}
+
+	if hijackErr != nil {
+		h.logger.Error("hijack failed on protocol switch", zap.Error(hijackErr))
 		return
 	}
 
@@ -63,58 +90,122 @@ func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request
 	}()
 	defer close(backConnCloseCh)
 
-	conn, brw, err := hj.Hijack()
-	if err != nil {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("Hijack failed on protocol switch: %v", err))
-		return
-	}
-	defer conn.Close()
-	res.Body = nil // so res.Write only writes the headers; we have res.Body in backConn above
-	if err := res.Write(brw); err != nil {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("response write: %v", err))
-		return
-	}
+	start := time.Now()
+	defer func() {
+		conn.Close()
+		logger.Debug("connection closed", zap.Duration("duration", time.Since(start)))
+	}()
+
 	if err := brw.Flush(); err != nil {
-		// p.getErrorHandler()(rw, req, fmt.Errorf("response flush: %v", err))
+		logger.Debug("response flush", zap.Error(err))
 		return
 	}
-	errc := make(chan error, 1)
+
+	// Ensure the hijacked client connection, and the new connection established
+	// with the backend, are both closed in the event of a server shutdown. This
+	// is done by registering them. We also try to gracefully close connections
+	// we recognize as websockets.
+	// We need to make sure the client connection messages (i.e. to upstream)
+	// are masked, so we need to know whether the connection is considered the
+	// server or the client side of the proxy.
+	gracefulClose := func(conn io.ReadWriteCloser, isClient bool) func() error {
+		if isWebsocket(req) {
+			return func() error {
+				return writeCloseControl(conn, isClient)
+			}
+		}
+		return nil
+	}
+	deleteFrontConn := h.registerConnection(conn, gracefulClose(conn, false))
+	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
+	defer deleteFrontConn()
+	defer deleteBackConn()
+
 	spc := switchProtocolCopier{user: conn, backend: backConn}
+
+	// setup the timeout if requested
+	var timeoutc <-chan time.Time
+	if h.StreamTimeout > 0 {
+		timer := time.NewTimer(time.Duration(h.StreamTimeout))
+		defer timer.Stop()
+		timeoutc = timer.C
+	}
+
+	errc := make(chan error, 1)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	<-errc
+	select {
+	case err := <-errc:
+		logger.Debug("streaming error", zap.Error(err))
+	case time := <-timeoutc:
+		logger.Debug("stream timed out", zap.Time("timeout", time))
+	}
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
 func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Duration {
-	resCT := res.Header.Get("Content-Type")
+	resCTHeader := res.Header.Get("Content-Type")
+	resCT, _, err := mime.ParseMediaType(resCTHeader)
 
 	// For Server-Sent Events responses, flush immediately.
 	// The MIME type is defined in https://www.w3.org/TR/eventsource/#text-event-stream
-	if resCT == "text/event-stream" {
+	if err == nil && resCT == "text/event-stream" {
 		return -1 // negative means immediately
 	}
 
-	// TODO: more specific cases? e.g. res.ContentLength == -1? (this TODO is from the std lib)
+	// We might have the case of streaming for which Content-Length might be unset.
+	if res.ContentLength == -1 {
+		return -1
+	}
+
+	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
+	if h.isBidirectionalStream(req, res) {
+		return -1
+	}
+
 	return time.Duration(h.FlushInterval)
 }
 
-func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.Duration) error {
+// isBidirectionalStream returns whether we should work in bi-directional stream mode.
+//
+// See https://github.com/caddyserver/caddy/pull/3620 for discussion of nuances.
+func (h Handler) isBidirectionalStream(req *http.Request, res *http.Response) bool {
+	// We have to check the encoding here; only flush headers with identity encoding.
+	// Non-identity encoding might combine with "encode" directive, and in that case,
+	// if body size larger than enc.MinLength, upper level encode handle might have
+	// Content-Encoding header to write.
+	// (see https://github.com/caddyserver/caddy/issues/3606 for use case)
+	ae := req.Header.Get("Accept-Encoding")
+
+	return req.ProtoMajor == 2 &&
+		res.ProtoMajor == 2 &&
+		res.ContentLength == -1 &&
+		(ae == "identity" || ae == "")
+}
+
+func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInterval time.Duration) error {
+	var w io.Writer = dst
+
 	if flushInterval != 0 {
-		if wf, ok := dst.(writeFlusher); ok {
-			mlw := &maxLatencyWriter{
-				dst:     wf,
-				latency: flushInterval,
-			}
-			defer mlw.stop()
-			dst = mlw
+		mlw := &maxLatencyWriter{
+			dst: dst,
+			//nolint:bodyclose
+			flush:   http.NewResponseController(dst).Flush,
+			latency: flushInterval,
 		}
+		defer mlw.stop()
+
+		// set up initial timer so headers get flushed even if body writes are delayed
+		mlw.flushPending = true
+		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
+
+		w = mlw
 	}
 
-	buf := streamingBufPool.Get().([]byte)
+	buf := streamingBufPool.Get().(*[]byte)
 	defer streamingBufPool.Put(buf)
-	_, err := h.copyBuffer(dst, src, buf)
+	_, err := h.copyBuffer(w, src, *buf)
 	return err
 }
 
@@ -122,7 +213,7 @@ func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.D
 // of bytes written.
 func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 	if len(buf) == 0 {
-		buf = make([]byte, 32*1024)
+		buf = make([]byte, defaultBufferSize)
 	}
 	var written int64
 	for {
@@ -143,7 +234,7 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, er
 				written += int64(nw)
 			}
 			if werr != nil {
-				return written, werr
+				return written, fmt.Errorf("writing: %w", werr)
 			}
 			if nr != nw {
 				return written, io.ErrShortWrite
@@ -151,20 +242,211 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, er
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
-				rerr = nil
+				return written, nil
 			}
-			return written, rerr
+			return written, fmt.Errorf("reading: %w", rerr)
 		}
 	}
 }
 
-type writeFlusher interface {
-	io.Writer
-	http.Flusher
+// registerConnection holds onto conn so it can be closed in the event
+// of a server shutdown. This is useful because hijacked connections or
+// connections dialed to backends don't close when server is shut down.
+// The caller should call the returned delete() function when the
+// connection is done to remove it from memory.
+func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	h.connectionsMu.Lock()
+	h.connections[conn] = openConnection{conn, gracefulClose}
+	h.connectionsMu.Unlock()
+	return func() {
+		h.connectionsMu.Lock()
+		delete(h.connections, conn)
+		// if there is no connection left before the connections close timer fires
+		if len(h.connections) == 0 && h.connectionsCloseTimer != nil {
+			// we release the timer that holds the reference to Handler
+			if (*h.connectionsCloseTimer).Stop() {
+				h.logger.Debug("stopped streaming connections close timer - all connections are already closed")
+			}
+			h.connectionsCloseTimer = nil
+		}
+		h.connectionsMu.Unlock()
+	}
+}
+
+// closeConnections immediately closes all hijacked connections (both to client and backend).
+func (h *Handler) closeConnections() error {
+	var err error
+	h.connectionsMu.Lock()
+	defer h.connectionsMu.Unlock()
+
+	for _, oc := range h.connections {
+		if oc.gracefulClose != nil {
+			// this is potentially blocking while we have the lock on the connections
+			// map, but that should be OK since the server has in theory shut down
+			// and we are no longer using the connections map
+			gracefulErr := oc.gracefulClose()
+			if gracefulErr != nil && err == nil {
+				err = gracefulErr
+			}
+		}
+		closeErr := oc.conn.Close()
+		if closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+// cleanupConnections closes hijacked connections.
+// Depending on the value of StreamCloseDelay it does that either immediately
+// or sets up a timer that will do that later.
+func (h *Handler) cleanupConnections() error {
+	if h.StreamCloseDelay == 0 {
+		return h.closeConnections()
+	}
+
+	h.connectionsMu.Lock()
+	defer h.connectionsMu.Unlock()
+	// the handler is shut down, no new connection can appear,
+	// so we can skip setting up the timer when there are no connections
+	if len(h.connections) > 0 {
+		delay := time.Duration(h.StreamCloseDelay)
+		h.connectionsCloseTimer = time.AfterFunc(delay, func() {
+			h.logger.Debug("closing streaming connections after delay",
+				zap.Duration("delay", delay))
+			err := h.closeConnections()
+			if err != nil {
+				h.logger.Error("failed to closed connections after delay",
+					zap.Error(err),
+					zap.Duration("delay", delay))
+			}
+		})
+	}
+	return nil
+}
+
+// writeCloseControl sends a best-effort Close control message to the given
+// WebSocket connection. Thanks to @pascaldekloe who provided inspiration
+// from his simple implementation of this I was able to learn from at:
+// github.com/pascaldekloe/websocket. Further work for handling masking
+// taken from github.com/gorilla/websocket.
+func writeCloseControl(conn io.Writer, isClient bool) error {
+	// Sources:
+	// https://github.com/pascaldekloe/websocket/blob/32050af67a5d/websocket.go#L119
+	// https://github.com/gorilla/websocket/blob/v1.5.0/conn.go#L413
+
+	// For now, we're not using a reason. We might later, though.
+	// The code handling the reason is left in
+	var reason string // max 123 bytes (control frame payload limit is 125; status code takes 2)
+
+	const closeMessage = 8
+	const finalBit = 1 << 7 // Frame header byte 0 bits from Section 5.2 of RFC 6455
+	const maskBit = 1 << 7  // Frame header byte 1 bits from Section 5.2 of RFC 6455
+	const goingAwayUpper uint8 = 1001 >> 8
+	const goingAwayLower uint8 = 1001 & 0xff
+
+	b0 := byte(closeMessage) | finalBit
+	b1 := byte(len(reason) + 2)
+	if isClient {
+		b1 |= maskBit
+	}
+
+	buf := make([]byte, 0, 127)
+	buf = append(buf, b0, b1)
+	msgLength := 4 + len(reason)
+
+	// Both branches below append the "going away" code and reason
+	appendMessage := func(buf []byte) []byte {
+		buf = append(buf, goingAwayUpper, goingAwayLower)
+		buf = append(buf, []byte(reason)...)
+		return buf
+	}
+
+	// When we're the client, we need to mask the message as per
+	// https://www.rfc-editor.org/rfc/rfc6455#section-5.3
+	if isClient {
+		key := newMaskKey()
+		buf = append(buf, key[:]...)
+		msgLength += len(key)
+		buf = appendMessage(buf)
+		maskBytes(key, 0, buf[2+len(key):])
+	} else {
+		buf = appendMessage(buf)
+	}
+
+	// simply best-effort, but return error for logging purposes
+	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
+	_, err := conn.Write(buf[:msgLength])
+	return err
+}
+
+// Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go
+func maskBytes(key [4]byte, pos int, b []byte) int {
+	// Mask one byte at a time for small buffers.
+	if len(b) < 2*wordSize {
+		for i := range b {
+			b[i] ^= key[pos&3]
+			pos++
+		}
+		return pos & 3
+	}
+
+	// Mask one byte at a time to word boundary.
+	if n := int(uintptr(unsafe.Pointer(&b[0]))) % wordSize; n != 0 {
+		n = wordSize - n
+		for i := range b[:n] {
+			b[i] ^= key[pos&3]
+			pos++
+		}
+		b = b[n:]
+	}
+
+	// Create aligned word size key.
+	var k [wordSize]byte
+	for i := range k {
+		k[i] = key[(pos+i)&3]
+	}
+	kw := *(*uintptr)(unsafe.Pointer(&k))
+
+	// Mask one word at a time.
+	n := (len(b) / wordSize) * wordSize
+	for i := 0; i < n; i += wordSize {
+		*(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(&b[0])) + uintptr(i))) ^= kw
+	}
+
+	// Mask one byte at a time for remaining bytes.
+	b = b[n:]
+	for i := range b {
+		b[i] ^= key[pos&3]
+		pos++
+	}
+
+	return pos & 3
+}
+
+// Copied from https://github.com/gorilla/websocket/blob/v1.5.0/conn.go#L184
+func newMaskKey() [4]byte {
+	n := weakrand.Uint32()
+	return [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+}
+
+// isWebsocket returns true if r looks to be an upgrade request for WebSockets.
+// It is a fairly naive check.
+func isWebsocket(r *http.Request) bool {
+	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
+		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// openConnection maps an open connection to
+// an optional function for graceful close.
+type openConnection struct {
+	conn          io.ReadWriteCloser
+	gracefulClose func() error
 }
 
 type maxLatencyWriter struct {
-	dst     writeFlusher
+	dst     io.Writer
+	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
 	mu           sync.Mutex // protects t, flushPending, and dst.Flush
@@ -177,7 +459,8 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	defer m.mu.Unlock()
 	n, err = m.dst.Write(p)
 	if m.latency < 0 {
-		m.dst.Flush()
+		//nolint:errcheck
+		m.flush()
 		return
 	}
 	if m.flushPending {
@@ -198,7 +481,8 @@ func (m *maxLatencyWriter) delayedFlush() {
 	if !m.flushPending { // if stop was called but AfterFunc already started this goroutine
 		return
 	}
-	m.dst.Flush()
+	//nolint:errcheck
+	m.flush()
 	m.flushPending = false
 }
 
@@ -214,7 +498,7 @@ func (m *maxLatencyWriter) stop() {
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
-	user, backend io.ReadWriter
+	user, backend io.ReadWriteCloser
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
@@ -228,7 +512,17 @@ func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 }
 
 var streamingBufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 32*1024)
+	New: func() any {
+		// The Pool's New function should generally only return pointer
+		// types, since a pointer can be put into the return interface
+		// value without an allocation
+		// - (from the package docs)
+		b := make([]byte, defaultBufferSize)
+		return &b
 	},
 }
+
+const (
+	defaultBufferSize = 32 * 1024
+	wordSize          = int(unsafe.Sizeof(uintptr(0)))
+)

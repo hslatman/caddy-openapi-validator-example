@@ -78,6 +78,9 @@ func Format(input []byte) []byte {
 		if comment {
 			if ch == '\n' {
 				comment = false
+				space = true
+				nextLine()
+				continue
 			} else {
 				write(ch)
 				continue
@@ -150,7 +153,10 @@ func Format(input []byte) []byte {
 			openBraceWritten = true
 			nextLine()
 			newLines = 0
-			nesting++
+			// prevent infinite nesting from ridiculous inputs (issue #4169)
+			if nesting < 10 {
+				nesting++
+			}
 		}
 
 		switch {
